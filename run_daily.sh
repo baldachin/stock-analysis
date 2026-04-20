@@ -16,9 +16,9 @@ fi
 
 cd /home/braveyun/stock_analysis
 
-# 1. 执行RPS分析 (沪深300全量排名)
+# 1. 执行RPS分析 (包含传统RPS和区间RPS)
 echo "[$DATE] 📊 执行RPS分析..." >> $LOG_FILE
-python3 scripts/rps_full_market.py >> $LOG_FILE 2>&1
+python3 scripts/daily_rps_with_range.py >> $LOG_FILE 2>&1
 if [ $? -eq 0 ]; then
     echo "[$DATE] ✅ RPS分析完成" >> $LOG_FILE
 else

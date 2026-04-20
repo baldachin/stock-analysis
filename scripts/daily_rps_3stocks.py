@@ -2,17 +2,19 @@
 """
 每日RPS追踪 - 专注三只股票
 中科创达(300496)、兆易创新(603986)、紫光国微(002049)
+使用我们的 SQLite 数据层
 """
 
-import requests
 import pandas as pd
 import numpy as np
 import sqlite3
 import os
-from datetime import datetime, timedelta
-import json
+from datetime import datetime
 
-DB_PATH = os.path.expanduser('~/stock_analysis/data/rps_tracker.db')
+# 使用我们的数据层
+from daily_data import read_daily_bars, get_close_prices, get_trading_dates
+
+DB_PATH = os.path.expanduser('~/stock_analysis/data/our_data.db')
 
 STOCKS = {
     '300496': '中科创达',
@@ -20,96 +22,53 @@ STOCKS = {
     '002049': '紫光国微'
 }
 
-# ============== API ==============
-
-def get_stock_hist_sina(symbol, days=300):
-    try:
-        url = 'https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData'
-        params = {'symbol': symbol, 'scale': '240', 'ma': '5', 'datalen': days}
-        r = requests.get(url, params=params, timeout=8)
-        data = r.json()
-        if not data: return pd.DataFrame()
-        df = pd.DataFrame(data)
-        df['day'] = pd.to_datetime(df['day'])
-        df = df.sort_values('day')
-        for col in ['open', 'high', 'low', 'close', 'volume']:
-            df[col] = df[col].astype(float)
-        return df
-    except: return pd.DataFrame()
-
-def get_stock_name_tx(symbol):
-    try:
-        url = f'https://qt.gtimg.cn/q={symbol}'
-        r = requests.get(url, timeout=5)
-        parts = r.text.split('~')
-        return parts[1] if len(parts) > 1 else ''
-    except: return ''
-
-def get_realtime(symbol):
-    try:
-        if symbol.startswith('6'): s = f'sh{symbol}'
-        else: s = f'sz{symbol}'
-        url = f'https://qt.gtimg.cn/q={s}'
-        r = requests.get(url, timeout=5)
-        parts = r.text.split('~')
-        if len(parts) < 10: return {}
-        return {
-            'name': parts[1],
-            'price': float(parts[3]) if parts[3] else 0,
-            'yesterday_close': float(parts[4]) if parts[4] else 0,
-            'open': float(parts[5]) if parts[5] else 0,
-            'high': float[33] if len(parts) > 33 and parts[33] else 0,
-            'low': float(parts[34]) if len(parts) > 34 and parts[34] else 0,
-            'volume': int(parts[6]) if parts[6] else 0,
-            'date': parts[30] if len(parts) > 30 else '',
-            'time': parts[31] if len(parts) > 31 else '',
-        }
-    except: return {}
-
-# ============== 分析 ==============
-
 def analyze_stock(code):
-    if code.startswith('6'): symbol = f'sh{code}'
-    else: symbol = f'sz{code}'
+    """使用我们的数据库分析股票"""
+    bars = read_daily_bars(code, days=400)
+    if not bars or len(bars) < 260:
+        return None
     
-    df = get_stock_hist_sina(symbol, 400)
-    if df.empty or len(df) < 260: return None
+    closes = [b['close'] for b in bars]
+    prices = np.array(closes)
     
-    close = df['close'].values
-    name = get_stock_name_tx(symbol)
-    price = close[-1]
-    prev_price = close[-2] if len(close) > 1 else price
+    name_row = None
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        name_row = conn.execute(
+            'SELECT name FROM stocks WHERE code = ?', (code,)
+        ).fetchone()
+    except:
+        pass
+    conn.close()
+    
+    name = (name_row[0] if name_row and name_row[0] else STOCKS.get(code, code))
+    price = closes[-1]
+    prev_price = closes[-2] if len(closes) > 1 else price
     
     result = {
         'code': code,
         'name': name,
         'price': price,
         'change': (price - prev_price) / prev_price * 100,
-        'date': df['day'].iloc[-1].strftime('%Y-%m-%d')
+        'date': bars[-1]['date'],
+        'source': 'our_db'
     }
     
     for period in [5, 10, 20, 50, 120, 250]:
-        if len(close) >= period + 2:
-            ret = (close[-1] - close[-period-1]) / close[-period-1] * 100
+        if len(closes) >= period + 2:
+            ret = (closes[-1] - closes[-period-1]) / closes[-period-1] * 100
             result[f'rps_{period}'] = ret
         else:
             result[f'rps_{period}'] = np.nan
     
     # 计算MACD (12,26,9)
-    if len(close) >= 34:
-        ema12 = pd.Series(close).ewm(span=12).mean().iloc[-1]
-        ema26 = pd.Series(close).ewm(span=26).mean().iloc[-1]
+    if len(closes) >= 34:
+        ema12 = pd.Series(closes).ewm(span=12).mean().iloc[-1]
+        ema26 = pd.Series(closes).ewm(span=26).mean().iloc[-1]
         macd_dif = ema12 - ema26
         macd_dea = pd.Series([macd_dif]).ewm(span=9).mean().iloc[-1]
         macd_bar = 2 * (macd_dif - macd_dea)
         result['macd'] = {'dif': macd_dif, 'dea': macd_dea, 'bar': macd_bar}
-    
-    # KDJ (9,3,3)
-    if len(close) >= 9:
-        high9 = pd.Series(close[-9:]).rolling(9).max().iloc[-1]
-        low9 = pd.Series(close[-9:]).rolling(9).min().iloc[-1]
-        rsv = (close[-1] - low9) / (high9 - low9) * 100 if high9 != low9 else 50
-        result['kdj'] = {'k': 50, 'd': 50, 'j': rsv}  # 简化版
     
     return result
 
@@ -120,6 +79,12 @@ def format_report(results, today):
     msg.append(f"📅 {today} | 🕐 {datetime.now().strftime('%H:%M')}")
     msg.append("")
     
+    # 数据来源
+    db_count = sum(1 for r in results if r and r.get('source') == 'our_db')
+    if db_count > 0:
+        msg.append(f"💾 数据: our_data.db")
+        msg.append("")
+    
     for code, name in STOCKS.items():
         data = next((r for r in results if r and r['code'] == code), None)
         
@@ -127,10 +92,10 @@ def format_report(results, today):
             msg.append(f"⚠️ **{name}({code})** - 数据获取失败")
             continue
         
-        # 股票头
+        source_emoji = "💾"
         change_emoji = "🟢" if data['change'] > 0 else "🔴"
         change_sign = "+" if data['change'] > 0 else ""
-        msg.append(f"{change_emoji} **{name}({code})**")
+        msg.append(f"{change_emoji} **{name}({code})** {source_emoji}")
         msg.append(f"   💰 {data['price']:.2f} ({change_sign}{data['change']:.2f}%)")
         
         # 各周期RPS
@@ -167,7 +132,6 @@ def format_report(results, today):
         
         msg.append(f"   趋势: {trend}")
         
-        # 关键价位提醒
         if rps_20 > 15:
             msg.append(f"   ⚠️ 短期涨幅过大，注意回调风险")
         elif rps_20 < -15:
@@ -183,13 +147,13 @@ def format_report(results, today):
     for i, r in enumerate(sorted_by_20):
         medal = "🥇" if i == 0 else "🥈" if i == 1 else "🥉" if i == 2 else "  "
         rps_val = r.get('rps_20', 0) or 0
-        msg.append(f"{medal} {r['name']}: RPS20={rps_val:+.1f}%")
+        source = "💾"
+        msg.append(f"{medal} {r['name']}: RPS20={rps_val:+.1f}% {source}")
     
     msg.append("")
     msg.append("─" * 40)
     msg.append("📝 **操作参考**")
     
-    # 简单建议
     for r in sorted_by_20:
         if r['code'] in STOCKS:
             rps_20 = r.get('rps_20', 0) or 0
@@ -209,7 +173,7 @@ def format_report(results, today):
             msg.append(f"• {r['name']}: {suggestion}")
     
     msg.append("")
-    msg.append(f"_数据来源: 新浪财经 | 分析时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}_")
+    msg.append(f"_💾 our_data.db | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}_")
     
     return "\n".join(msg)
 
@@ -217,6 +181,7 @@ def main():
     today = datetime.now().strftime('%Y-%m-%d')
     
     print(f"📥 分析三只股票: {', '.join(STOCKS.values())}")
+    print(f"💾 使用 our_data.db 数据层")
     
     results = []
     for code in STOCKS.keys():
@@ -231,13 +196,12 @@ def main():
         print("❌ 未能获取任何数据")
         return
     
-    # 生成报告
     report = format_report(results, today)
     print("\n" + "=" * 50)
     print(report)
     print("=" * 50)
     
-    # 保存到文件供调用
+    # 保存
     output_path = os.path.expanduser('~/stock_analysis/data/daily_rps_3stocks.txt')
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(report)
